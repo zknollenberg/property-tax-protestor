@@ -1,18 +1,23 @@
 {
   "builds": [
     {
-      "src": "app.py",
+      "src": "api/index.py",
       "use": "@vercel/python",
       "config": {
         "maxLambdaSize": "15mb",
-        "includeFiles": ["templates/**", "static/**"]
+        "includeFiles": [
+          "templates/**",
+          "models.py",
+          "ccad_client.py",
+          "protest_engine.py"
+        ]
       }
     }
   ],
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "/app.py"
+      "dest": "/api/index.py"
     }
   ]
 }

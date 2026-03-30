@@ -1,43 +1,50 @@
 """
 Property Tax Protest — Collin County, TX  (demo)
 
-Run:
+Run locally:
     pip install -r requirements.txt
     uvicorn app:app --reload
 
 Then open http://localhost:8000
 """
 
-import os
 import logging
-from contextlib import asynccontextmanager
+import os
+from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from models import LookupRequest, AnalyzeRequest
 from ccad_client import CCadClient
+from models import AnalyzeRequest, LookupRequest
 from protest_engine import build_report, format_protest_letter
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Application state ─────────────────────────────────────────────────────────
+# Absolute paths work correctly in both local and serverless environments.
+BASE_DIR = Path(__file__).parent
+
+# ── Lazy client initialisation ────────────────────────────────────────────────
+# We do NOT use a lifespan hook because Vercel serverless functions have no
+# persistent startup phase.  The client is created on first use and reused
+# within the same process (warm invocations).
 
 _client: CCadClient | None = None
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+def get_client() -> CCadClient:
     global _client
-    _client = CCadClient()
-    yield
-    await _client._http.aclose()
+    if _client is None:
+        _client = CCadClient()
+    return _client
 
+
+# ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Collin County Property Tax Protest",
@@ -46,11 +53,10 @@ app = FastAPI(
         "dataset (data.texas.gov) and builds an unequal-appraisal protest "
         "package using only real CCAD data."
     ),
-    lifespan=lifespan,
 )
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
 # ── Pages ─────────────────────────────────────────────────────────────────────
@@ -74,8 +80,9 @@ async def lookup_property(req: LookupRequest):
     if not req.address.strip():
         raise HTTPException(status_code=400, detail="Address is required.")
 
+    client = get_client()
     try:
-        rows = await _client.search_by_address(req.address)
+        rows = await client.search_by_address(req.address)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
@@ -91,15 +98,14 @@ async def lookup_property(req: LookupRequest):
             ),
         )
 
-    # Return all matches so the UI can let the user pick the right one
-    properties = [_client.map_to_property(r) for r in rows]
+    properties = [client.map_to_property(r) for r in rows]
     return {
         "matches": [p.model_dump() for p in properties],
         "raw_records": rows,
         "data_source": (
             f"Collin CAD Appraisal Database — Texas Open Data Portal "
-            f"(data.texas.gov, dataset {_client._dataset_id}, "
-            f"tax year {_client._data_year})"
+            f"(data.texas.gov, dataset {client._dataset_id}, "
+            f"tax year {client._data_year})"
         ),
     }
 
@@ -109,10 +115,6 @@ async def analyze_property(req: AnalyzeRequest):
     """
     Find comparable properties in the same CCAD neighborhood and build
     a protest report.
-
-    `account_num` is used to exclude the subject from the comps list.
-    `effective_tax_rate` should come from the owner's actual Collin County
-    tax bill (City + ISD + County + MUD rates combined).
     """
     if not req.neighborhood_cd:
         raise HTTPException(
@@ -129,8 +131,9 @@ async def analyze_property(req: AnalyzeRequest):
             detail="Building square footage is required for the analysis.",
         )
 
+    client = get_client()
     try:
-        raw_comps = await _client.get_comparables(
+        raw_comps = await client.get_comparables(
             neighborhood_cd=req.neighborhood_cd,
             bldg_sqft=req.bldg_sqft,
             yr_built=req.yr_built,
@@ -138,8 +141,6 @@ async def analyze_property(req: AnalyzeRequest):
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
-    # Reconstruct a minimal PropertyInfo for the subject from the request
-    # (the full record was already returned by /api/lookup)
     from models import PropertyInfo
     subject = PropertyInfo(
         account_num=req.account_num,
@@ -154,15 +155,15 @@ async def analyze_property(req: AnalyzeRequest):
         subject=subject,
         raw_comps=raw_comps,
         effective_tax_rate_pct=req.effective_tax_rate,
-        client=_client,
+        client=client,
     )
 
     return {
         "report": report.model_dump(),
         "data_source": (
             f"Collin CAD Appraisal Database — Texas Open Data Portal "
-            f"(data.texas.gov, dataset {_client._dataset_id}, "
-            f"tax year {_client._data_year})"
+            f"(data.texas.gov, dataset {client._dataset_id}, "
+            f"tax year {client._data_year})"
         ),
     }
 
@@ -171,14 +172,12 @@ async def analyze_property(req: AnalyzeRequest):
 async def generate_letter(payload: dict):
     """
     Generate a plain-text protest letter from a previously computed report.
-    The caller passes the full report JSON plus optional owner contact info.
     """
-    from models import ProtestReport, PropertyInfo, ComparableProperty
+    from models import ComparableProperty, PropertyInfo, ProtestReport
     try:
         report_data = payload.get("report", {})
         contact     = payload.get("contact", {})
 
-        # Rebuild typed objects
         subject = PropertyInfo(**report_data["subject"])
         comps   = [ComparableProperty(**c) for c in report_data.get("comps", [])]
         report  = ProtestReport(
@@ -196,12 +195,9 @@ async def generate_letter(payload: dict):
 
 @app.get("/api/schema")
 async def get_schema():
-    """
-    Return one raw CCAD record and the auto-discovered field map.
-    Useful for debugging field-name issues with a new dataset.
-    """
+    """Return one raw CCAD record and the auto-discovered field map."""
     try:
-        return await _client.get_schema()
+        return await get_client().get_schema()
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
